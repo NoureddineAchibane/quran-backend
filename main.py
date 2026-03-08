@@ -34,7 +34,7 @@ AUDIO_DIR.mkdir(exist_ok=True)
 app = FastAPI(title="Quran Audio Service", version="5.0.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:3001", "https://*.vercel.app"],
+    allow_origins=["http://localhost:3000", "http://localhost:3001", "https://quran-frontend-clyc0edgm-noureddineachibanes-projects.vercel.app", "https://quran-frontend-git-vercel-r-7be73a-noureddineachibanes-projects.vercel.app/"],
     allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
 )
 
