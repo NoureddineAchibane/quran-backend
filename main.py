@@ -1,9 +1,9 @@
 """
-Quran Audio Service — FastAPI v5.0
-  - Concurrent ayah downloads via asyncio.gather + Semaphore (non-blocking)
-  - everyayah.com CDN — no global ayah number lookup needed
-  - 15 reciters (IDs match quran.com)
-  - Progress events fire as each download completes (true parallel)
+Quran Audio Service — FastAPI v6.0
+  - Concurrent downloads (asyncio.gather + Semaphore)
+  - everyayah.com CDN
+  - Per-ayah timestamps sent in 'done' event for frontend sync
+  - _merge_with_timings() returns merged bytes + list of {ayah, start_ms, end_ms}
 """
 
 import asyncio, io, json, tempfile, uuid
@@ -22,7 +22,7 @@ try:
 except ImportError:
     PYDUB_OK = False
 
-# ── Config ──────────────────────────────────────────────────────────────
+# ── Config ────────────────────────────────────────────────────────────────
 QURAN_BASE     = "https://api.quran.com/api/v4"
 EVERYAYAH      = "https://everyayah.com/data"
 TIMEOUT        = aiohttp.ClientTimeout(total=30, connect=8)
@@ -31,14 +31,14 @@ MAX_AYAHS      = 300
 AUDIO_DIR      = Path(tempfile.gettempdir()) / "quran_audio"
 AUDIO_DIR.mkdir(exist_ok=True)
 
-app = FastAPI(title="Quran Audio Service", version="5.0.0")
+app = FastAPI(title="Quran Audio Service", version="6.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000", "http://localhost:3001", "https://quran-frontend-clyc0edgm-noureddineachibanes-projects.vercel.app", "https://quran-frontend-git-vercel-r-7be73a-noureddineachibanes-projects.vercel.app"],
     allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
 )
 
-# ── Schemas ─────────────────────────────────────────────────────────────
+# ── Schemas ───────────────────────────────────────────────────────────────
 class AudioRequest(BaseModel):
     recitation_id: int           = Field(..., example=7)
     surah_number:  int           = Field(..., example=1)
@@ -56,7 +56,7 @@ class SurahOut(BaseModel):
     id: int; name_arabic: str; name_simple: str
     translated_name: str; verses_count: int; revelation_place: str
 
-# ── Reciter registry ─────────────────────────────────────────────────────
+# ── Reciter registry ──────────────────────────────────────────────────────
 RECITERS = [
     {"id":  1, "name_ar": "عبد الباسط — مرتّل",        "name_en": "Abdul Basit Murattal",   "folder": "Abdul_Basit_Murattal_192kbps"},
     {"id":  2, "name_ar": "عبد الباسط — مجوّد",        "name_en": "Abdul Basit Mujawwad",   "folder": "Abdul_Basit_Mujawwad_128kbps"},
@@ -77,11 +77,11 @@ RECITERS = [
 _RMAP = {r["id"]: r for r in RECITERS}
 FALLBACK_FOLDER = "Alafasy_128kbps"
 
-# ── URL helpers ──────────────────────────────────────────────────────────
+# ── URL helper ────────────────────────────────────────────────────────────
 def _url(folder: str, surah: int, ayah: int) -> str:
     return f"{EVERYAYAH}/{folder}/{surah:03d}{ayah:03d}.mp3"
 
-# ── Fetch one raw MP3 ────────────────────────────────────────────────────
+# ── Fetch one MP3 raw bytes ───────────────────────────────────────────────
 async def _fetch_raw(session: aiohttp.ClientSession, url: str) -> tuple[bytes, bool]:
     try:
         async with session.get(url) as r:
@@ -93,7 +93,7 @@ async def _fetch_raw(session: aiohttp.ClientSession, url: str) -> tuple[bytes, b
     except Exception:
         return b"", False
 
-# ── Download one ayah — with semaphore + fallback + progress ────────────
+# ── Download one ayah with semaphore + fallback + progress ───────────────
 async def _fetch_ayah(
     session: aiohttp.ClientSession,
     sem: asyncio.Semaphore,
@@ -113,40 +113,69 @@ async def _fetch_ayah(
             status = "failed"
 
         if on_progress:
-            await on_progress({"type": "progress", "ayah": ayah,
-                               "index": index, "total": total, "status": status})
+            await on_progress({
+                "type": "progress", "ayah": ayah,
+                "index": index, "total": total, "status": status,
+            })
         return data if ok else b""
 
-# ── Merge MP3 bytes ──────────────────────────────────────────────────────
-def _merge(chunks: list[bytes]) -> bytes:
+# ── Merge + compute per-ayah timestamps ──────────────────────────────────
+def _merge_with_timings(
+    chunks: list[bytes],
+    ayah_numbers: list[int],
+) -> tuple[bytes, list[dict]]:
+    """
+    Merge MP3 chunks into one file.
+    Returns (merged_bytes, timings) where timings = [
+        {"ayah": 1, "start_ms": 0,    "end_ms": 4200},
+        {"ayah": 2, "start_ms": 4200, "end_ms": 9100},
+        ...
+    ]
+    """
     if not PYDUB_OK:
         raise HTTPException(500, "pydub not installed — pip install pydub audioop-lts")
-    combined = AudioSegment.empty()
-    for raw in chunks:
-        if raw:
-            combined += AudioSegment.from_file(io.BytesIO(raw), format="mp3")
+
+    combined   = AudioSegment.empty()
+    timings    = []
+    cursor_ms  = 0
+
+    for raw, ayah_num in zip(chunks, ayah_numbers):
+        if not raw:
+            continue
+        seg       = AudioSegment.from_file(io.BytesIO(raw), format="mp3")
+        dur_ms    = len(seg)          # pydub len() = duration in milliseconds
+        timings.append({
+            "ayah":     ayah_num,
+            "start_ms": cursor_ms,
+            "end_ms":   cursor_ms + dur_ms,
+        })
+        combined  += seg
+        cursor_ms += dur_ms
+
     if len(combined) == 0:
         raise HTTPException(502, "All ayah downloads failed")
+
     buf = io.BytesIO()
     combined.export(buf, format="mp3", bitrate="128k")
-    return buf.getvalue()
+    return buf.getvalue(), timings
 
-# ── Main pipeline ────────────────────────────────────────────────────────
+# ── Main pipeline ─────────────────────────────────────────────────────────
 async def _pipeline(
     req: AudioRequest,
     on_progress: Optional[Callable] = None,
-) -> tuple[bytes, str, int, int]:
+) -> tuple[bytes, str, int, int, list[dict]]:
+    """Returns (merged_bytes, filename, ayah_min, ayah_max, timings)."""
     rec = _RMAP.get(req.recitation_id)
     if not rec:
         raise HTTPException(400, f"recitation_id {req.recitation_id} not found")
     folder = rec["folder"]
 
-    # Resolve ayah range
+    # Resolve range
     if req.whole_surah:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as s:
             r = await s.get(f"{QURAN_BASE}/chapters/{req.surah_number}")
             if r.status != 200:
-                raise HTTPException(502, "Cannot fetch surah info from quran.com")
+                raise HTTPException(502, "Cannot fetch surah info")
             ch = (await r.json())["chapter"]
         ayah_min, ayah_max = 1, ch["verses_count"]
     else:
@@ -162,7 +191,7 @@ async def _pipeline(
     if on_progress:
         await on_progress({"type": "start", "total": total})
 
-    # Concurrent downloads — all fire at once, limited by semaphore
+    # Concurrent downloads
     sem = asyncio.Semaphore(MAX_CONCURRENT)
     connector = aiohttp.TCPConnector(limit=MAX_CONCURRENT, limit_per_host=MAX_CONCURRENT)
     async with aiohttp.ClientSession(timeout=TIMEOUT, connector=connector) as session:
@@ -176,11 +205,12 @@ async def _pipeline(
     if on_progress:
         await on_progress({"type": "merging", "message": f"Merging {total} ayahs..."})
 
-    merged = _merge(chunks)
-    fname  = f"surah_{req.surah_number}_ayah_{ayah_min}-{ayah_max}.mp3"
-    return merged, fname, ayah_min, ayah_max
+    # Merge and compute real timestamps from actual MP3 durations
+    merged, timings = _merge_with_timings(chunks, ayahs)
+    fname = f"surah_{req.surah_number}_ayah_{ayah_min}-{ayah_max}.mp3"
+    return merged, fname, ayah_min, ayah_max, timings
 
-# ── Routes ───────────────────────────────────────────────────────────────
+# ── Routes ────────────────────────────────────────────────────────────────
 @app.get("/recitations", response_model=list[RecitationOut])
 async def get_recitations():
     return [RecitationOut(id=r["id"], reciter_name=r["name_ar"],
@@ -244,14 +274,20 @@ async def ws_generate(ws: WebSocket):
             if req.ayah_min < 1 or req.ayah_max < req.ayah_min:
                 await send({"type": "error", "message": "Invalid ayah range"}); return
 
-        merged, fname, *_ = await _pipeline(req, on_progress=send)
+        merged, fname, ayah_min, ayah_max, timings = await _pipeline(req, on_progress=send)
+
         uid = uuid.uuid4().hex[:8]
         out = f"{uid}_{fname}"
         (AUDIO_DIR / out).write_bytes(merged)
 
-        await send({"type": "done", "filename": fname,
-                    "download_url": f"/audio/{out}",
-                    "size_kb": round(len(merged) / 1024, 1)})
+        # Send timings alongside download URL so frontend can sync exactly
+        await send({
+            "type":         "done",
+            "filename":     fname,
+            "download_url": f"/audio/{out}",
+            "size_kb":      round(len(merged) / 1024, 1),
+            "timings":      timings,   # [{ayah, start_ms, end_ms}, ...]
+        })
 
     except WebSocketDisconnect:
         pass
