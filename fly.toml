@@ -1,0 +1,5 @@
+app = "app-damp-sun-7779"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
